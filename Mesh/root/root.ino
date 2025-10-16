@@ -10,11 +10,19 @@
 #define MESH_PASSWORD "88888888"
 #define PORT 5555
 
+#define KEYPAD_ADDR 0x20
+#define LCD_ADDR 0x27
+
 painlessMesh mesh;
 Scheduler userScheduler;
-File file;
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+LiquidCrystal_I2C lcd(LCD_ADDR, 20, 4);
 
+char keys[16] = {
+  '1', '2', '3', 'A',
+  '4', '5', '6', 'B',
+  '7', '8', '9', 'C',
+  '*', '0', '#', 'D'
+};
 uint8_t buzzerPin = 4;
 uint8_t wakupPin = 34;
 
@@ -28,15 +36,27 @@ std::vector<String> bufferSensorValue;
 uint8_t timeWaitSensorValue = 0;
 StaticJsonDocument<200> payload;
 
-/*Parameters: {
+int timeLcdOn;
+
+/*{
   "time": {
-    "read": 2,
-    "send": 10
+    "read": 1,
+    "send": 30,
+    "screen": 1
   },
   "threshold": {
-    "tmp": 35,
-    "hum": 50,
-    "som": 40,
+    "tmp": {
+      "up": 35,
+      "down": 28
+    },
+    "hum": {
+      "up": 60,
+      "down": 40
+    },
+    "som": {
+      "up": 60,
+      "down": 40
+    },
     "lux": {
       "up": 30,
       "down": 10
@@ -47,8 +67,10 @@ StaticJsonDocument<200> payload;
 void printlnSerial(String str);
 void receivedCallback(uint32_t from, String &msg);
 void newConnectionCallback(uint32_t nodeId);
+void writeFile(String path, String content);
 void readSystemInformation();
 void initPayload();
+char readKey();
 
 Task commandProcessing(TASK_SECOND, TASK_FOREVER, [](){
   if(bufferCommand.size()) {
@@ -61,6 +83,9 @@ Task commandProcessing(TASK_SECOND, TASK_FOREVER, [](){
         uint32_t id = packet["id"].as<uint32_t>();
         if( !nodes.containsKey(name) || nodes[name].as<uint32_t>() != id) {
           nodes[name] = id;
+          String doc;
+          serializeJsonPretty(nodes, doc);
+          writeFile("/system/nodes.txt", doc);
           printlnSerial("Notification: New connection, Name: " + name + " - ID: " + String(id));
           // write file
         }
@@ -129,17 +154,17 @@ Task sensorValueProcessing( TASK_SECOND, TASK_FOREVER, [](){
         Serial.println("Sent data: " + msg);
       }
       Serial1.println("done");
-      if(tmpAveVal > parameters["threshold"]["tmp"].as<int>()) {
+      if(tmpAveVal > parameters["threshold"]["tmp"]["up"].as<int>() || tmpAveVal < parameters["threshold"]["tmp"]["down"].as<int>()) {
         flagTemperature++;
       } else {
         flagTemperature = 0;
       }
-      if(humAveVal > parameters["threshold"]["hum"].as<int>()) {
+      if(humAveVal > parameters["threshold"]["hum"]["up"].as<int>() || humAveVal < parameters["threshold"]["hum"]["down"].as<int>()) {
         flagHumidity++;
       } else {
         flagHumidity = 0;
       }
-      if(luxAveVal < parameters["threshold"]["som"].as<int>()) {
+      if(luxAveVal > parameters["threshold"]["som"]["up"].as<int>() || luxAveVal < parameters["threshold"]["som"]["down"].as<int>()) {
         flagSoilMoisture++;
       } else {
         flagSoilMoisture = 0;
@@ -183,93 +208,521 @@ Task controlBuzzer(TASK_SECOND, TASK_FOREVER, [](){
   }
 });
 
-int timeLcdOn = 600;
-int checkValueChange = 0;
-uint8_t stateBacklightLcd = 1;
-
-Task controlLCD(100 * TASK_MILLISECOND, TASK_FOREVER, [](){
-  if(timeLcdOn > 0) {
-    timeLcdOn--;
-    if(checkValueChange != tmpLcd + humLcd + luxLcd + somLcd) {
-      checkValueChange = tmpLcd + humLcd + luxLcd + somLcd;
-      stateBacklightLcd = 1;
+enum SETTING_OPTION {
+  SET_OFF = 0,
+  SET_ON = 1,
+  SET_TIME_READ = 2,
+  SET_TIME_SEND = 3,
+  SET_TIME_SCREEN = 4,
+  SET_THRESHOLD_TMP = 5,
+  SET_THRESHOLD_HUM = 6,
+  SET_THRESHOLD_SOM = 7,
+  SET_THRESHOLD_LUX = 8,
+};
+uint8_t curSetting = SET_OFF;
+uint8_t preSetting = 9;
+bool updateScreen = true;
+String tempVal = "";
+uint8_t typeThresh = 0; // 0: up, 1: down
+Task setting(TASK_MILLISECOND, TASK_FOREVER, [](){
+  static bool touchActive = false;
+  static unsigned long touchStart = 0;
+  static const unsigned long holdTime = 5000; // 5s
+  static const unsigned long timeOut = 20000; // 2p
+  if(curSetting == SET_OFF) {
+    if(digitalRead(wakupPin) == 1) {
+      if(!touchActive) {
+        touchActive = true;
+        touchStart = millis();
+      } else {
+        if(millis() - touchStart >= holdTime) {
+          touchStart = millis();
+          curSetting = SET_ON;
+        }
+      }
+    } else {
+      touchActive = false;
     }
-    if(stateBacklightLcd == 1) {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Temp");
-      if(flagTemperature >= 5) {
-        lcd.setCursor(2, 1);
-        lcd.print("!" + String(tmpLcd));
-      } else {
-        lcd.setCursor(1, 1);
-        lcd.print(String(tmpLcd));
+  } else {
+    if(millis() - touchStart <= timeOut) {
+      char key = readKey();
+      if(key) {
+        touchStart = millis();
+        switch(curSetting) {
+        case SET_ON:
+          if(key >= '1' && key <= '7') {
+            curSetting = (key - '0') + 1;
+          } else if(key == 'C') {
+            curSetting = SET_OFF;
+            preSetting = SET_OFF;
+            readKey();
+          }
+          break;
+        case SET_TIME_READ:
+          if(key >= '0' && key <= '9' && tempVal.length() < 2) {
+            tempVal += String(key);
+            printlnSerial("Temp Val: " + tempVal);
+          } else if(key == 'A') {
+            if(tempVal.toInt() <= parameters["time"]["send"].as<int>()) {
+              String doc;
+              StaticJsonDocument<200> packet;
+              packet["name"] = MY_NAME;
+              packet["type"] = 1;
+              packet["cmd"] = "settime";
+              packet["read"] = tempVal.toInt();
+              serializeJson(packet, doc);
+              mesh.sendBroadcast(doc);
+              parameters["time"]["read"] = tempVal.toInt();
+              serializeJsonPretty(parameters, doc);
+              writeFile("/system/parameters.txt", doc);
+              printlnSerial("Sensor read time changed successfully.");
+            }
+            tempVal = "";
+            curSetting = SET_ON;
+          } else if(key == 'B') {
+            tempVal = "";
+          } else if(key == 'C') {
+            tempVal = "";
+            curSetting = SET_ON;
+          }
+          break;
+        case SET_TIME_SEND:
+          if(key >= '0' && key <= '9' && tempVal.length() < 2) {
+            tempVal += String(key);
+            printlnSerial("Temp Val: " + tempVal);
+          } else if(key == 'A') {
+            if(tempVal.toInt() >= parameters["time"]["read"].as<int>()) {
+              String doc;
+              parameters["time"]["send"] = tempVal.toInt();
+              serializeJsonPretty(parameters, doc);
+              writeFile("/system/parameters.txt", doc);
+              printlnSerial("Sensor send time changed successfully.");
+            }
+            tempVal = "";
+            curSetting = SET_ON;
+          } else if(key == 'B') {
+            tempVal = "";
+          } else if(key == 'C') {
+            tempVal = "";
+            curSetting = SET_ON;
+          }
+          break;
+        case SET_TIME_SCREEN:
+          if(key >= '0' && key <= '9' && tempVal.length() < 2) {
+            tempVal += String(key);
+            printlnSerial("Temp Val: " + tempVal);
+          } else if(key == 'A') {
+            if(tempVal) {
+              String doc;
+              parameters["time"]["screen"] = tempVal.toInt();              
+              serializeJsonPretty(parameters, doc);
+              writeFile("/system/parameters.txt", doc);
+              timeLcdOn = parameters["time"]["screen"].as<int>() * 60000;
+              printlnSerial("Screen brightness time has been changed.");
+            }
+            tempVal = "";
+            curSetting = SET_ON;
+          } else if(key == 'B') {
+            tempVal = "";
+          } else if(key == 'C') {
+            tempVal = "";
+            curSetting = SET_ON;
+          }
+          break;
+        case SET_THRESHOLD_TMP:
+          if(key >= '0' && key <= '9' && tempVal.length() < 2) {
+            tempVal += String(key);
+            printlnSerial("Temp Val: " + tempVal);
+          } else if(key == 'A') {
+            if(tempVal) {
+              if(typeThresh == 0 && tempVal.toInt() > parameters["threshold"]["tmp"]["down"]) {
+                String doc;
+                parameters["threshold"]["tmp"]["up"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Upper temperature threshold changed successfully.");
+                typeThresh = 1;
+                tempVal = "";
+              } else if(typeThresh == 1 && tempVal.toInt() < parameters["threshold"]["tmp"]["up"]) {
+                String doc;
+                parameters["threshold"]["tmp"]["down"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Lower temperature threshold changed successfully.");
+                typeThresh = 2;
+              } else printlnSerial("Unsuccessfully!");
+            } else printlnSerial("Unsuccessfully!");
+            if(typeThresh == 2) {
+              typeThresh = 0;
+              tempVal = "";
+              curSetting = SET_ON;
+            }
+          } else if(key == 'B') {
+            tempVal = "";
+          } else if(key == 'C') {
+            tempVal = "";
+            curSetting = SET_ON;
+          }
+          break;
+        case SET_THRESHOLD_HUM:
+          if(key >= '0' && key <= '9' && tempVal.length() < 2) {
+            tempVal += String(key);
+            printlnSerial("Temp Val: " + tempVal);
+          } else if(key == 'A') {
+            if(tempVal) {
+              if(typeThresh == 0 && tempVal.toInt() > parameters["threshold"]["hum"]["down"]) {
+                String doc;
+                parameters["threshold"]["hum"]["up"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Upper humidity threshold changed successfully.");
+                typeThresh = 1;
+                tempVal = "";
+              } else if(typeThresh == 1 && tempVal.toInt() < parameters["threshold"]["hum"]["up"]) {
+                String doc;
+                parameters["threshold"]["hum"]["down"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Lower humidity threshold changed successfully.");
+                typeThresh = 2;
+              } else printlnSerial("Unsuccessfully!");
+            } else printlnSerial("Unsuccessfully!");
+            if(typeThresh == 2) {
+              typeThresh = 0;
+              tempVal = "";
+              curSetting = SET_ON;
+            }
+          } else if(key == 'B') {
+            tempVal = "";
+          } else if(key == 'C') {
+            tempVal = "";
+            curSetting = SET_ON;
+          }
+          break;
+        case SET_THRESHOLD_SOM:
+          if(key >= '0' && key <= '9' && tempVal.length() < 2) {
+            tempVal += String(key);
+            printlnSerial("Temp Val: " + tempVal);
+          } else if(key == 'A') {
+            if(tempVal) {
+              if(typeThresh == 0 && tempVal.toInt() > parameters["threshold"]["som"]["down"]) {
+                String doc;
+                parameters["threshold"]["som"]["up"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Upper soil-moisture threshold changed successfully.");
+                typeThresh = 1;
+                tempVal = "";
+              } else if(typeThresh == 1 && tempVal.toInt() < parameters["threshold"]["som"]["up"]) {
+                String doc;
+                parameters["threshold"]["som"]["down"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Lower soil-moisture threshold changed successfully.");
+                typeThresh = 2;
+              } else printlnSerial("Unsuccessfully!");
+            } else printlnSerial("Unsuccessfully!");
+            if(typeThresh == 2) {
+              typeThresh = 0;
+              tempVal = "";
+              curSetting = SET_ON;
+            }
+          } else if(key == 'B') {
+            tempVal = "";
+          } else if(key == 'C') {
+            tempVal = "";
+            curSetting = SET_ON;
+          }
+          break;
+        case SET_THRESHOLD_LUX:
+          if(key >= '0' && key <= '9' && tempVal.length() < 2) {
+            tempVal += String(key);
+            printlnSerial("Temp Val: " + tempVal);
+          } else if(key == 'A') {
+            if(tempVal) {
+              if(typeThresh == 0 && tempVal.toInt() > parameters["threshold"]["lux"]["down"]) {
+                String doc;
+                parameters["threshold"]["lux"]["up"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Upper luminosity threshold changed successfully.");
+                typeThresh = 1;
+                tempVal = "";
+              } else if(typeThresh == 1 && tempVal.toInt() < parameters["threshold"]["lux"]["up"]) {
+                String doc;
+                parameters["threshold"]["lux"]["down"] = tempVal.toInt();              
+                serializeJsonPretty(parameters, doc);
+                writeFile("/system/parameters.txt", doc);
+                printlnSerial("Lower luminosity threshold changed successfully.");
+                typeThresh = 2;
+              } else printlnSerial("Unsuccessfully!");
+            } else printlnSerial("Unsuccessfully!");
+            if(typeThresh == 2) {
+              typeThresh = 0;
+              tempVal = "";
+              curSetting = SET_ON;
+            }
+          } else if(key == 'B') {
+            tempVal = "";
+          } else if(key == 'C') {
+            tempVal = "";
+            curSetting = SET_ON;
+          }
+          break;
+        }
+        updateScreen = true;
       }
-      
-      lcd.setCursor(10, 0);
-      lcd.print("Humi");
-      if(flagHumidity >= 5) {
-        lcd.setCursor(10, 1);
-        lcd.print("!" + String(humLcd));
-      } else {
-        lcd.setCursor(11, 1);
-        lcd.print(String(humLcd));
-      }
-      
-      lcd.setCursor(5, 2);
-      lcd.print("Soil");
-      if(flagSoilMoisture >= 5) {
-        lcd.setCursor(4, 3);
-        lcd.print("!" + String(somLcd));
-      } else {
-        lcd.setCursor(6, 3);
-        lcd.print(String(somLcd));
-      }
-      
-      lcd.setCursor(15, 2);
-      lcd.print("Light");
-      if(flagLuminosity >= 5) {
-        lcd.setCursor(15, 3);
-        lcd.print("!" + String(luxLcd));
-      } else {
-        lcd.setCursor(16, 3);
-        lcd.print(String(luxLcd));
-      }
-      stateBacklightLcd = 0;
-    }
-  }
-  if(timeLcdOn == 0) {
-    timeLcdOn--;
-    lcd.clear();
-    lcd.noBacklight();
-    stateBacklightLcd = 0;
-  }
-  if(digitalRead(wakupPin)) {
-    timeLcdOn = 600;
-    if(stateBacklightLcd == 0) {
-      lcd.backlight();
-      stateBacklightLcd = 1;
+    } else {
+      curSetting = SET_OFF;
     }
   }
 });
 
-// Task setting(TASK_SECOND, TASK_FOREVER, [](){
-//   if(digitalRead(wakupPin)) {
-//     int start = millis();
-//     uint8_t flag = 0; // 0: wakup, 1: setting
-//     while(digitalRead(wakupPin))) {
-//       if(millis() - timeWait == 5) {
-//         flag = 1;
-//         break;
-//       }
-//     }
-//     if(flag)
-//   }
-// });
+Task controlLCD(TASK_MILLISECOND, TASK_FOREVER, [](){
+  static int checkValueChange = 0;
+  static bool stateBacklightLcd = true;
+  if(curSetting == SET_OFF) {
+    if(timeLcdOn > 0) {
+      timeLcdOn--;
+      if(checkValueChange != tmpLcd + humLcd + luxLcd + somLcd) {
+        checkValueChange = tmpLcd + humLcd + luxLcd + somLcd;
+        updateScreen = true;
+      }
+      if(updateScreen) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Temp      Humi");
+        if(flagTemperature >= 5) {
+          lcd.setCursor(1, 1);
+          lcd.print("!" + String(tmpLcd));
+        } else {
+          lcd.setCursor(1, 1);
+          lcd.print(String(tmpLcd));
+        }
+        if(flagHumidity >= 5) {
+          lcd.setCursor(10, 1);
+          lcd.print("!" + String(humLcd));
+        } else {
+          lcd.setCursor(11, 1);
+          lcd.print(String(humLcd));
+        }
+        
+        lcd.setCursor(5, 2);
+        lcd.print("Soil      Light");
+        if(flagSoilMoisture >= 5) {
+          lcd.setCursor(4, 3);
+          lcd.print("!" + String(somLcd));
+        } else {
+          lcd.setCursor(6, 3);
+          lcd.print(String(somLcd));
+        }
+        if(flagLuminosity >= 5) {
+          lcd.setCursor(15, 3);
+          lcd.print("!" + String(luxLcd));
+        } else {
+          lcd.setCursor(16, 3);
+          lcd.print(String(luxLcd));
+        }
+        updateScreen = false;
+      }
+    } else if(timeLcdOn == 0) {
+      lcd.clear();
+      lcd.noBacklight();
+      timeLcdOn = -1;
+      stateBacklightLcd = false;
+    }
+    if(digitalRead(wakupPin) && stateBacklightLcd == false) {
+      lcd.backlight();
+      timeLcdOn = parameters["time"]["screen"].as<int>() * 60000;
+      updateScreen = true;
+      stateBacklightLcd = true;
+    }
+  } else {
+    if(curSetting != preSetting || updateScreen == true) {
+      preSetting = curSetting;
+      switch(curSetting) {
+      case SET_ON:
+        lcd.clear();
+        lcd.setCursor(1, 0);
+        lcd.print("SETTING   4.ThTmp");
+        lcd.setCursor(1, 1);
+        lcd.print("1.TmRead  5.ThHum");
+        lcd.setCursor(1, 2);
+        lcd.print("2.TmSend  6.ThSom");
+        lcd.setCursor(1, 3);
+        lcd.print("3.TmScrn  7.ThLux");
+        break;
+      case SET_TIME_READ:
+        lcd.clear();
+        lcd.setCursor(2,0);
+        lcd.print("SENSOR READ TIME");
+        lcd.setCursor(1, 1);
+        lcd.print("Present Value: " + (parameters["time"]["read"].as<String>().length() == 1 ? "0" + parameters["time"]["read"].as<String>() : parameters["time"]["read"].as<String>()) + "s");
+        lcd.setCursor(9, 2);
+        if(tempVal == "") {
+          lcd.print("__");
+        } else lcd.print(tempVal);
+        break;
+      case SET_TIME_SEND:
+        lcd.clear();
+        lcd.setCursor(2,0);
+        lcd.print("SENSOR SEND TIME");
+        lcd.setCursor(1, 1);
+        lcd.print("Present Value: " + (parameters["time"]["send"].as<String>().length() == 1 ? "0" + parameters["time"]["send"].as<String>() : parameters["time"]["send"].as<String>()) + "s");
+        lcd.setCursor(9, 2);
+        if(tempVal == "") {
+          lcd.print("__");
+        } else lcd.print(tempVal);
+        break;
+      case SET_TIME_SCREEN:
+        lcd.clear();
+        lcd.setCursor(3,0);
+        lcd.print("SCREEN ON TIME");
+        lcd.setCursor(1, 1);
+        lcd.print("Present Value: " + (parameters["time"]["screen"].as<String>().length() == 1 ? "0" + parameters["time"]["screen"].as<String>() : parameters["time"]["screen"].as<String>()) + "m");
+        lcd.setCursor(9, 2);
+        if(tempVal == "") {
+          lcd.print("__");
+        } else lcd.print(tempVal);
+        break;
+      case SET_THRESHOLD_TMP:
+        lcd.clear();
+        lcd.setCursor(1,0);
+        lcd.print("SET TEMP THRESHOLD");
+        lcd.setCursor(6, 1); //threashold current
+        lcd.print(parameters["threshold"]["tmp"]["down"].as<String>() + " - " + parameters["threshold"]["tmp"]["up"].as<String>());
+        if(typeThresh == 0) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: __");
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + tempVal);
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          }
+        } else if(typeThresh == 1) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["tmp"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["tmp"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: " + tempVal);
+          }
+        }
+        break;
+      case SET_THRESHOLD_HUM:
+        lcd.clear();
+        lcd.setCursor(1,0);
+        lcd.print("SET HUMI THRESHOLD");
+        lcd.setCursor(6, 1); //threashold current
+        lcd.print(parameters["threshold"]["hum"]["down"].as<String>() + " - " + parameters["threshold"]["hum"]["up"].as<String>());
+        if(typeThresh == 0) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: __");
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + tempVal);
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          }
+        } else if(typeThresh == 1) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["hum"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["hum"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: " + tempVal);
+          }
+        }
+        break;
+      case SET_THRESHOLD_SOM:
+        lcd.clear();
+        lcd.setCursor(1,0);
+        lcd.print("SET SOIL THRESHOLD");
+        lcd.setCursor(6, 1); //threashold current
+        lcd.print(parameters["threshold"]["som"]["down"].as<String>() + " - " + parameters["threshold"]["som"]["up"].as<String>());
+        if(typeThresh == 0) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: __");
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + tempVal);
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          }
+        } else if(typeThresh == 1) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["som"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["som"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: " + tempVal);
+          }
+        }
+        break;
+      case SET_THRESHOLD_LUX:
+        lcd.clear();
+        lcd.setCursor(1,0);
+        lcd.print("SET LIGHT THRESHOLD");
+        lcd.setCursor(6, 1); //threashold current
+        lcd.print(parameters["threshold"]["lux"]["down"].as<String>() + " - " + parameters["threshold"]["lux"]["up"].as<String>());
+        if(typeThresh == 0) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: __");
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + tempVal);
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          }
+        } else if(typeThresh == 1) {
+          if(tempVal == "") {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["lux"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: __");
+          } else {
+            lcd.setCursor(0, 2);
+            lcd.print("Upper Threshold: " + parameters["threshold"]["lux"]["up"].as<String>());
+            lcd.setCursor(0, 3);
+            lcd.print("Lower Threshold: " + tempVal);
+          }
+        }
+        break;
+      }
+      updateScreen = false;
+    }
+  }
+});
 
 void setup() {
   pinMode(buzzerPin, OUTPUT);
   pinMode(wakupPin, INPUT);
+  Wire.begin();
   Serial.begin(115200);
   Serial1.begin(9600, SERIAL_8N1, 16, 17);
   lcd.init();
@@ -282,6 +735,7 @@ void setup() {
   }
   readSystemInformation();
   numNodes = nodes.size();
+  timeLcdOn = parameters["time"]["screen"].as<int>() * 60000;
   initPayload();
 
   mesh.setRoot();
@@ -302,6 +756,8 @@ void setup() {
   controlBuzzer.enable();
   userScheduler.addTask(controlLCD);
   controlLCD.enable();
+  userScheduler.addTask(setting);
+  setting.enable();
 
   lcd.setCursor(7, 0);
   lcd.print("HELLO");
@@ -340,9 +796,17 @@ void newConnectionCallback(uint32_t nodeId) {
   printlnSerial("New connection: " + String(nodeId));
 }
 
+void writeFile(String path, String content) {
+  File file = SD.open(path, FILE_WRITE);
+  if(file) {
+    file.println(content);
+    file.close();
+  }
+}
+
 void readSystemInformation() {
   String doc;
-  file = SD.open("/system/nodes.txt");
+  File file = SD.open("/system/nodes.txt");
   if(file) {
     while(file.available()) {
       doc += (char) file.read();
@@ -385,3 +849,44 @@ void initPayload() {
   node["lux"] = 0;
   node["som"] = 0;
 }
+
+char readKey() {
+  static unsigned long lastCheck = 0;
+  static bool waitingRelease = false;
+  static uint8_t lastKeyIndex = 255;
+  const unsigned long debounceTime = 50; // chống dội phím
+
+  if (millis() - lastCheck < debounceTime) return '\0';
+  lastCheck = millis();
+
+  uint8_t lowByte = 0, highByte = 0;
+  uint16_t data = 0xFFFF;
+
+  Wire.requestFrom(KEYPAD_ADDR, 2);
+  if (Wire.available() == 2) {
+    lowByte = Wire.read();
+    highByte = Wire.read();
+    data = (highByte << 8) | lowByte;
+  }
+
+  if (waitingRelease) {
+    if (!(data & (1 << lastKeyIndex))) {
+      waitingRelease = false;
+      lastKeyIndex = 255;
+    }
+    return '\0';
+  }
+
+  if (data != 0xFFFF) {
+    for (uint8_t i = 0; i < 16; i++) {
+      if (data & (1 << i)) {
+        waitingRelease = true;
+        lastKeyIndex = i;
+        return keys[i];
+      }
+    }
+  }
+
+  return '\0';
+}
+
